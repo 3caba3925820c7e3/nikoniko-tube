@@ -1,25 +1,157 @@
 import asyncio
+import logging
 import os
 import re
+import time
+import uuid
+from dataclasses import dataclass
 from urllib.parse import urlparse, urljoin, quote
+
 import httpx
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("nicostream")
 
 app = FastAPI(title="NicoStream")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 NICO_SEARCH_API = "https://snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search"
+PROXY_API = os.getenv(
+    "PROXY_API_URL",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get"
+    "?request=display_proxies&proxy_format=protocolipport&format=text"
+    "&country=jp&protocol=http"
+)
+PROXY_REFRESH_SECONDS = int(os.getenv("PROXY_REFRESH_SECONDS", "300"))
+PROXY_TEST_TIMEOUT = float(os.getenv("PROXY_TEST_TIMEOUT", "6"))
+PROXY_CANDIDATES = int(os.getenv("PROXY_CANDIDATES", "40"))
+
+UPSTREAM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Referer": "https://www.nicovideo.jp/",
+    "Origin": "https://www.nicovideo.jp",
+}
+
+@dataclass
+class ProxyState:
+    url: str
+    checked_at: float
+
+_proxy_state: ProxyState | None = None
+_proxy_lock = asyncio.Lock()
+_sessions: dict[str, dict] = {}
+_sessions_lock = asyncio.Lock()
+SESSION_TTL = int(os.getenv("SESSION_TTL", "21600"))
+
+def _normalize_proxy(line: str) -> str | None:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if "://" not in line:
+        line = "http://" + line
+    p = urlparse(line)
+    if p.scheme not in ("http", "https") or not p.hostname or not p.port:
+        return None
+    return f"{p.scheme}://{p.hostname}:{p.port}"
+
+async def _fetch_proxy_candidates() -> list[str]:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        r = await client.get(PROXY_API, headers={"User-Agent": "NicoStream/1.0"})
+        r.raise_for_status()
+        candidates = []
+        for line in r.text.splitlines():
+            p = _normalize_proxy(line)
+            if p and p not in candidates:
+                candidates.append(p)
+        return candidates[:PROXY_CANDIDATES]
+
+async def _test_proxy(proxy: str) -> bool:
+    # First check the exit country. Then make a real Niconico request.
+    try:
+        timeout = httpx.Timeout(PROXY_TEST_TIMEOUT, connect=PROXY_TEST_TIMEOUT)
+        async with httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=True) as c:
+            country = await c.get("https://ipapi.co/country/", headers=UPSTREAM_HEADERS)
+            if country.status_code != 200 or country.text.strip().upper() != "JP":
+                return False
+            nico = await c.get("https://www.nicovideo.jp/", headers=UPSTREAM_HEADERS)
+            return nico.status_code < 500
+    except Exception:
+        return False
+
+async def _choose_jp_proxy(force: bool = False) -> str:
+    global _proxy_state
+    now = time.time()
+    if not force and _proxy_state and now - _proxy_state.checked_at < PROXY_REFRESH_SECONDS:
+        return _proxy_state.url
+
+    async with _proxy_lock:
+        now = time.time()
+        if not force and _proxy_state and now - _proxy_state.checked_at < PROXY_REFRESH_SECONDS:
+            return _proxy_state.url
+
+        candidates = await _fetch_proxy_candidates()
+        # Test in small parallel batches. Free proxies are volatile, so don't trust
+        # the list's advertised status until the proxy itself is checked from here.
+        for start in range(0, len(candidates), 10):
+            batch = candidates[start:start + 10]
+            results = await asyncio.gather(*(_test_proxy(p) for p in batch), return_exceptions=True)
+            for proxy, ok in zip(batch, results):
+                if ok is True:
+                    _proxy_state = ProxyState(proxy, time.time())
+                    logger.info("Selected JP proxy: %s", proxy)
+                    return proxy
+
+        raise RuntimeError("No working Japanese HTTP proxy is currently available")
+
+async def _session_proxy(session_id: str | None) -> str:
+    if not session_id:
+        return await _choose_jp_proxy()
+    async with _sessions_lock:
+        s = _sessions.get(session_id)
+        if not s:
+            raise HTTPException(status_code=410, detail="Playback session expired")
+        s["last_seen"] = time.time()
+        return s["proxy"]
+
+async def _new_session(proxy: str, allowed_urls: list[str]) -> str:
+    sid = uuid.uuid4().hex
+    async with _sessions_lock:
+        _sessions[sid] = {
+            "proxy": proxy,
+            "allowed": set(allowed_urls),
+            "created": time.time(),
+            "last_seen": time.time(),
+        }
+    return sid
+
+async def _cleanup_sessions():
+    while True:
+        await asyncio.sleep(600)
+        cutoff = time.time() - SESSION_TTL
+        async with _sessions_lock:
+            dead = [k for k, v in _sessions.items() if v["last_seen"] < cutoff]
+            for k in dead:
+                _sessions.pop(k, None)
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(_cleanup_sessions())
+    # Warm the proxy asynchronously; the first request still works if it has to wait.
+    asyncio.create_task(_warm_proxy())
+
+async def _warm_proxy():
+    try:
+        await _choose_jp_proxy()
+    except Exception as e:
+        logger.warning("Initial JP proxy warm-up failed: %s", e)
 
 async def nico_search(query: str, limit: int):
-    # The old approach fed https://www.nicovideo.jp/search/<query> straight into
-    # yt-dlp's generic/flat extractor. That page renders its results with
-    # client-side JS, so a flat HTML scrape finds no video entries and silently
-    # returns an empty list (200 OK, 0 results) instead of raising.
-    # Use Niconico's official public Snapshot Search JSON API instead, which
-    # returns results directly with no JS rendering involved.
+    proxy = await _choose_jp_proxy()
     params = {
         "q": query,
         "targets": "title,description,tags",
@@ -29,9 +161,8 @@ async def nico_search(query: str, limit: int):
         "_limit": str(limit),
         "_context": "nicostream",
     }
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; NicoStream/1.0)"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(NICO_SEARCH_API, params=params, headers=headers)
+    async with httpx.AsyncClient(proxy=proxy, timeout=15) as client:
+        resp = await client.get(NICO_SEARCH_API, params=params, headers=UPSTREAM_HEADERS)
         resp.raise_for_status()
         return resp.json()
 
@@ -47,7 +178,8 @@ async def search(q: str = Query(..., min_length=1), limit: int = Query(12, ge=1,
         if not content_id:
             continue
         results.append({
-            "id": content_id, "title": item.get("title") or "Untitled",
+            "id": content_id,
+            "title": item.get("title") or "Untitled",
             "url": f"https://www.nicovideo.jp/watch/{content_id}",
             "thumbnail": item.get("thumbnailUrl"),
             "duration": item.get("lengthSeconds"),
@@ -55,8 +187,12 @@ async def search(q: str = Query(..., min_length=1), limit: int = Query(12, ge=1,
         })
     return {"results": results}
 
-def get_info(video_url: str):
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+def get_info(video_url: str, proxy: str):
+    opts = {
+        "quiet": True, "no_warnings": True, "skip_download": True,
+        "proxy": proxy,
+        "http_headers": UPSTREAM_HEADERS,
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(video_url, download=False)
 
@@ -65,40 +201,38 @@ async def info(url: str = Query(...)):
     if not url.startswith(("https://www.nicovideo.jp/", "http://www.nicovideo.jp/")):
         raise HTTPException(status_code=400, detail="Only NicoNico URLs are accepted")
     try:
-        data = await asyncio.to_thread(get_info, url)
+        proxy = await _choose_jp_proxy()
+        data = await asyncio.to_thread(get_info, url, proxy)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not read video: {e}")
+
     formats = []
+    allowed_urls = []
     for f in data.get("formats", []):
-        if not f.get("url"): continue
+        media_url = f.get("url")
+        if not media_url:
+            continue
         formats.append({
             "format_id": f.get("format_id"), "ext": f.get("ext"),
             "protocol": f.get("protocol"), "height": f.get("height"),
             "width": f.get("width"), "vcodec": f.get("vcodec"),
-            "acodec": f.get("acodec"), "tbr": f.get("tbr"), "url": f.get("url")
+            "acodec": f.get("acodec"), "tbr": f.get("tbr"), "url": media_url
         })
+        allowed_urls.append(media_url)
+
+    session_id = await _new_session(proxy, allowed_urls)
     return {
         "id": data.get("id"), "title": data.get("title"),
         "thumbnail": data.get("thumbnail"), "duration": data.get("duration"),
-        "formats": formats
+        "session_id": session_id, "formats": formats
     }
-
-# Niconico's delivery CDN (domand) rejects requests with no Referer/User-Agent,
-# and its playlists use byte-range-addressed fMP4 segments, so Range support
-# is required too.
-UPSTREAM_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Referer": "https://www.nicovideo.jp/",
-    "Origin": "https://www.nicovideo.jp",
-}
 
 _M3U8_URI_ATTR = re.compile(r'URI="([^"]+)"')
 
-def _proxy_url(absolute_url: str) -> str:
-    return "/api/stream?url=" + quote(absolute_url, safe="")
+def _proxy_url(absolute_url: str, session_id: str) -> str:
+    return "/api/stream?sid=" + quote(session_id, safe="") + "&url=" + quote(absolute_url, safe="")
 
-def _rewrite_manifest(text: str, base_url: str) -> str:
+def _rewrite_manifest(text: str, base_url: str, session_id: str) -> str:
     out_lines = []
     for line in text.splitlines():
         stripped = line.strip()
@@ -106,62 +240,67 @@ def _rewrite_manifest(text: str, base_url: str) -> str:
             m = _M3U8_URI_ATTR.search(line)
             if m:
                 abs_uri = urljoin(base_url, m.group(1))
-                line = line[:m.start(1)] + _proxy_url(abs_uri) + line[m.end(1):]
+                line = line[:m.start(1)] + _proxy_url(abs_uri, session_id) + line[m.end(1):]
             out_lines.append(line)
         elif stripped:
             abs_uri = urljoin(base_url, stripped)
-            out_lines.append(_proxy_url(abs_uri))
+            out_lines.append(_proxy_url(abs_uri, session_id))
         else:
             out_lines.append(line)
     return "\n".join(out_lines)
 
 def _is_manifest(content_type: str, url: str, body_start: bytes) -> bool:
-    if "mpegurl" in content_type.lower():
-        return True
-    if url.split("?", 1)[0].endswith(".m3u8"):
-        return True
-    return body_start.lstrip().startswith(b"#EXTM3U")
+    return ("mpegurl" in content_type.lower()
+            or url.split("?", 1)[0].endswith(".m3u8")
+            or body_start.lstrip().startswith(b"#EXTM3U"))
 
 @app.get("/api/stream")
-async def stream(request: Request, url: str = Query(...)):
+async def stream(request: Request, sid: str = Query(...), url: str = Query(...)):
+    proxy = await _session_proxy(sid)
     if urlparse(url).scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="Invalid media URL")
+
+    # Only URLs returned by yt-dlp for this exact playback session are accepted.
+    async with _sessions_lock:
+        session = _sessions.get(sid)
+        allowed = session["allowed"] if session else set()
+    # HLS child URLs are generated by the upstream manifest, so allow them after
+    # the first authorized media URL has established the session's host.
+    if url not in allowed:
+        if not any(urlparse(a).hostname == urlparse(url).hostname for a in allowed):
+            raise HTTPException(status_code=403, detail="URL is not part of this playback session")
 
     headers = dict(UPSTREAM_HEADERS)
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
 
-    client = httpx.AsyncClient(follow_redirects=True, timeout=30)
+    client = httpx.AsyncClient(proxy=proxy, follow_redirects=True, timeout=30)
     try:
-        req = client.build_request("GET", url, headers=headers)
-        upstream = await client.send(req, stream=True)
+        upstream = await client.send(client.build_request("GET", url, headers=headers), stream=True)
         if upstream.status_code >= 400:
+            body_snippet = (await upstream.aread())[:500]
             await upstream.aclose()
-            await client.aclose()
-            raise HTTPException(status_code=502, detail=f"Upstream returned {upstream.status_code}")
+            logger.warning("Upstream %s for %s", upstream.status_code, url)
+            raise HTTPException(status_code=502, detail=f"Upstream returned {upstream.status_code}: {body_snippet[:200]!r}")
     except HTTPException:
+        await client.aclose()
         raise
     except Exception as e:
         await client.aclose()
-        raise HTTPException(status_code=502, detail=f"Stream failed: {e}")
+        logger.exception("Stream request failed")
+        raise HTTPException(status_code=502, detail=f"Stream failed: {type(e).__name__}: {e}")
 
     content_type = upstream.headers.get("content-type", "application/octet-stream")
-
-    # Manifests are small text files: buffer, rewrite embedded URLs so segment/key
-    # requests come back through this proxy (with the same required headers),
-    # then close the upstream connection.
     if _is_manifest(content_type, str(upstream.url), b""):
         body = await upstream.aread()
         await upstream.aclose()
         await client.aclose()
         if _is_manifest(content_type, str(upstream.url), body):
-            rewritten = _rewrite_manifest(body.decode("utf-8", "ignore"), str(upstream.url))
-            return HTMLResponse(content=rewritten, media_type="application/vnd.apple.mpegurl")
+            rewritten = _rewrite_manifest(body.decode("utf-8", "ignore"), str(upstream.url), sid)
+            return Response(content=rewritten, media_type="application/vnd.apple.mpegurl")
         return StreamingResponse(iter([body]), media_type=content_type)
 
-    # Media segments: stream through, forwarding range/length headers so seeking
-    # and byte-range fMP4 segments keep working.
     async def body_iter():
         try:
             async for chunk in upstream.aiter_bytes():
@@ -174,9 +313,12 @@ async def stream(request: Request, url: str = Query(...)):
     for h in ("content-length", "content-range", "accept-ranges"):
         if h in upstream.headers:
             passthrough_headers[h] = upstream.headers[h]
-
     return StreamingResponse(body_iter(), status_code=upstream.status_code,
-                              media_type=content_type, headers=passthrough_headers)
+                             media_type=content_type, headers=passthrough_headers)
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "proxy_ready": _proxy_state is not None}
 
 @app.get("/", response_class=HTMLResponse)
 async def index():

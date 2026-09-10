@@ -34,7 +34,7 @@ async function play(item){status.textContent='ストリームを準備中...';tr
 let fs=(d.formats||[]).filter(x=>x.url),f=fs.filter(x=>x.vcodec!=='none'&&x.acodec!=='none').sort((a,b)=>(b.height||0)-(a.height||0))[0]||fs.find(x=>x.vcodec!=='none');if(!f)throw Error('再生可能な形式が見つかりません');
 playerTitle.textContent=d.title||item.title;player.style.display='block';window.scrollTo({top:0,behavior:'smooth'});status.textContent='';
 teardownHls();video.removeAttribute('src');video.load();
-let streamUrl='/api/stream?url='+encodeURIComponent(f.url);
+let streamUrl='/api/stream?sid='+encodeURIComponent(d.session_id)+'&url='+encodeURIComponent(f.url);
 let isHls=(f.protocol||'').includes('m3u8')||f.url.split('?')[0].endsWith('.m3u8');
 if(isHls&&window.Hls&&Hls.isSupported()){
   hls=new Hls();hls.loadSource(streamUrl);hls.attachMedia(video);
