@@ -1,4 +1,4 @@
-name: Auto Extract Zip (keep yml only)
+name: Sync Repository with Uploaded Zip
 
 # zipファイルがpushされたら自動発火
 on:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  extract-zip:
+  sync-with-zip:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract zip files, keep only yml/yaml, remove zip
+      - name: Replace repo contents with zip contents
         run: |
           set -eu
 
@@ -27,67 +27,61 @@ jobs:
             sudo apt-get install -y unzip
           fi
 
-          found_any=false
+          # 保護するファイル(このワークフロー自身)
+          PROTECTED_FILE=".github/workflows/auto-extract-zip.yml"
 
-          # リポジトリ内にある全ての .zip を探索(.gitディレクトリは除外)
-          while IFS= read -r -d '' zipfile; do
-            found_any=true
-            echo "======================================"
-            echo "Processing: $zipfile"
-            echo "======================================"
+          # リポジトリ内の全zipファイルを探す(.gitは除外)
+          zip_files=$(find . -type f -iname "*.zip" -not -path "./.git/*" || true)
 
-            # zipの中身を事前にリストしてログに残す(デバッグ用)
-            echo "--- zip contents ---"
-            unzip -l "$zipfile" || echo "!! unzip -l failed for $zipfile"
-
-            dir=$(dirname "$zipfile")
-            base=$(basename "$zipfile" .zip)
-            dest_dir="$dir/$base"
-            tmp_dir=$(mktemp -d)
-
-            # 一旦テンポラリディレクトリに展開する(本番ディレクトリを直接汚さない)
-            if ! unzip -o "$zipfile" -d "$tmp_dir"; then
-              echo "!! ERROR: unzip failed for $zipfile"
-              rm -rf "$tmp_dir"
-              continue
-            fi
-
-            echo "--- extracted file count (all) ---"
-            find "$tmp_dir" -type f | wc -l
-
-            mkdir -p "$dest_dir"
-
-            # yml/yaml ファイルだけを、ディレクトリ構造を保ったまま dest_dir にコピー
-            yml_count=0
-            while IFS= read -r -d '' ymlfile; do
-              rel_path="${ymlfile#"$tmp_dir"/}"
-              mkdir -p "$dest_dir/$(dirname "$rel_path")"
-              cp "$ymlfile" "$dest_dir/$rel_path"
-              yml_count=$((yml_count + 1))
-            done < <(find "$tmp_dir" -type f \( -iname "*.yml" -o -iname "*.yaml" \) -print0)
-
-            echo "--- copied yml/yaml file count: $yml_count ---"
-
-            if [ "$yml_count" -eq 0 ]; then
-              echo "!! WARNING: $zipfile に yml/yaml ファイルが1つも見つかりませんでした"
-            fi
-
-            rm -rf "$tmp_dir"
-            rm -f "$zipfile"
-
-            echo "=== Done: $dest_dir ==="
-          done < <(find . -type f -iname "*.zip" -not -path "./.git/*" -print0)
-
-          if [ "$found_any" = false ]; then
-            echo "対象のzipファイルが見つかりませんでした。"
+          if [ -z "$zip_files" ]; then
+            echo "対象のzipファイルが見つかりませんでした。処理をスキップします。"
+            exit 0
           fi
+
+          echo "--- 見つかったzip ---"
+          echo "$zip_files"
+
+          # ワークフロー自身を退避(消えないようにバックアップ)
+          backup_dir=$(mktemp -d)
+          if [ -f "$PROTECTED_FILE" ]; then
+            mkdir -p "$backup_dir/$(dirname "$PROTECTED_FILE")"
+            cp "$PROTECTED_FILE" "$backup_dir/$PROTECTED_FILE"
+            echo "保護ファイルを退避しました: $PROTECTED_FILE"
+          fi
+
+          # 一旦テンポラリディレクトリに全zipを展開(複数あれば全部マージ)
+          tmp_dir=$(mktemp -d)
+          echo "$zip_files" | while IFS= read -r zipfile; do
+            echo "=== Extracting: $zipfile ==="
+            unzip -l "$zipfile" || echo "!! unzip -l failed for $zipfile"
+            unzip -o "$zipfile" -d "$tmp_dir"
+          done
+
+          echo "--- zipから展開された内容(リポジトリに反映されるファイル) ---"
+          find "$tmp_dir" -type f
+
+          # .git 以外のリポジトリ内の既存ファイル/フォルダを全削除
+          echo "--- 既存ファイルを削除中 ---"
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+
+          # zipの中身をリポジトリ直下にコピー(zip自体はここで含まれないので自動的に消える)
+          cp -a "$tmp_dir"/. .
+
+          # 保護ファイルを復元
+          if [ -f "$backup_dir/$PROTECTED_FILE" ]; then
+            mkdir -p "$(dirname "$PROTECTED_FILE")"
+            cp "$backup_dir/$PROTECTED_FILE" "$PROTECTED_FILE"
+            echo "保護ファイルを復元しました: $PROTECTED_FILE"
+          fi
+
+          rm -rf "$tmp_dir" "$backup_dir"
 
       - name: Show final state (debug)
         run: |
           echo "--- git status ---"
           git status
-          echo "--- tracked yml/yaml files after extraction ---"
-          find . -type f \( -iname "*.yml" -o -iname "*.yaml" \) -not -path "./.git/*"
+          echo "--- 現在のファイル一覧(.git除く) ---"
+          find . -not -path "./.git*" -maxdepth 2
 
       - name: Commit and push changes
         run: |
@@ -97,6 +91,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore: auto-extract zip, keep yml only, remove zip [skip ci]"
+            git commit -m "chore: sync repository with uploaded zip contents [skip ci]"
             git push
           fi
