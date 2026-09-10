@@ -10,34 +10,47 @@ from fastapi.staticfiles import StaticFiles
 app = FastAPI(title="NicoStream")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def nico_search(query: str, limit: int):
-    # Search NicoNico's public search page; do not use the unsupported nicoquery scheme.
-    url = "https://www.nicovideo.jp/search/" + query
-    opts = {
-        "quiet": True, "no_warnings": True, "skip_download": True,
-        "extract_flat": True, "playlistend": limit
+NICO_SEARCH_API = "https://snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search"
+
+async def nico_search(query: str, limit: int):
+    # The old approach fed https://www.nicovideo.jp/search/<query> straight into
+    # yt-dlp's generic/flat extractor. That page renders its results with
+    # client-side JS, so a flat HTML scrape finds no video entries and silently
+    # returns an empty list (200 OK, 0 results) instead of raising.
+    # Use Niconico's official public Snapshot Search JSON API instead, which
+    # returns results directly with no JS rendering involved.
+    params = {
+        "q": query,
+        "targets": "title,description,tags",
+        "fields": "contentId,title,userId,lengthSeconds,thumbnailUrl,viewCounter",
+        "_sort": "-viewCounter",
+        "_offset": "0",
+        "_limit": str(limit),
+        "_context": "nicostream",
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; NicoStream/1.0)"}
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(NICO_SEARCH_API, params=params, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
 
 @app.get("/api/search")
 async def search(q: str = Query(..., min_length=1), limit: int = Query(12, ge=1, le=30)):
     try:
-        data = await asyncio.to_thread(nico_search, q, limit)
+        data = await nico_search(q, limit)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Search failed: {e}")
     results = []
-    for item in data.get("entries") or []:
-        if not item: continue
-        vid = item.get("id")
-        url = item.get("webpage_url") or item.get("url")
-        if not url and vid:
-            url = f"https://www.nicovideo.jp/watch/{vid}"
+    for item in data.get("data") or []:
+        content_id = item.get("contentId")
+        if not content_id:
+            continue
         results.append({
-            "id": vid, "title": item.get("title") or "Untitled",
-            "url": url, "thumbnail": item.get("thumbnail"),
-            "duration": item.get("duration"),
-            "uploader": item.get("uploader") or item.get("channel")
+            "id": content_id, "title": item.get("title") or "Untitled",
+            "url": f"https://www.nicovideo.jp/watch/{content_id}",
+            "thumbnail": item.get("thumbnailUrl"),
+            "duration": item.get("lengthSeconds"),
+            "uploader": None
         })
     return {"results": results}
 
