@@ -20,46 +20,80 @@ jobs:
 
       - name: Extract zip files, keep only yml/yaml, remove zip
         run: |
-          set -e
+          set -eu
 
-          # unzipコマンドが無い場合に備えてインストール(ubuntu-latestには通常入っている)
           if ! command -v unzip &> /dev/null; then
             sudo apt-get update -y
             sudo apt-get install -y unzip
           fi
 
+          found_any=false
+
           # リポジトリ内にある全ての .zip を探索(.gitディレクトリは除外)
-          # → どのリポジトリ・どんな場所にあるzipでも対応
-          find . -type f -iname "*.zip" -not -path "./.git/*" -print0 | while IFS= read -r -d '' zipfile; do
-            echo "=== Processing: $zipfile ==="
+          while IFS= read -r -d '' zipfile; do
+            found_any=true
+            echo "======================================"
+            echo "Processing: $zipfile"
+            echo "======================================"
+
+            # zipの中身を事前にリストしてログに残す(デバッグ用)
+            echo "--- zip contents ---"
+            unzip -l "$zipfile" || echo "!! unzip -l failed for $zipfile"
 
             dir=$(dirname "$zipfile")
             base=$(basename "$zipfile" .zip)
-            extract_dir="$dir/$base"
+            dest_dir="$dir/$base"
+            tmp_dir=$(mktemp -d)
 
-            mkdir -p "$extract_dir"
+            # 一旦テンポラリディレクトリに展開する(本番ディレクトリを直接汚さない)
+            if ! unzip -o "$zipfile" -d "$tmp_dir"; then
+              echo "!! ERROR: unzip failed for $zipfile"
+              rm -rf "$tmp_dir"
+              continue
+            fi
 
-            # zip解凍(文字化け対策としてUTF-8指定、日本語ファイル名にも対応)
-            unzip -o -O UTF-8 "$zipfile" -d "$extract_dir" || unzip -o "$zipfile" -d "$extract_dir"
+            echo "--- extracted file count (all) ---"
+            find "$tmp_dir" -type f | wc -l
 
-            # yml, yaml 以外のファイルを全部削除
-            find "$extract_dir" -type f ! -iname "*.yml" ! -iname "*.yaml" -delete
+            mkdir -p "$dest_dir"
 
-            # 中身が空になったディレクトリを削除
-            find "$extract_dir" -type d -empty -delete
+            # yml/yaml ファイルだけを、ディレクトリ構造を保ったまま dest_dir にコピー
+            yml_count=0
+            while IFS= read -r -d '' ymlfile; do
+              rel_path="${ymlfile#"$tmp_dir"/}"
+              mkdir -p "$dest_dir/$(dirname "$rel_path")"
+              cp "$ymlfile" "$dest_dir/$rel_path"
+              yml_count=$((yml_count + 1))
+            done < <(find "$tmp_dir" -type f \( -iname "*.yml" -o -iname "*.yaml" \) -print0)
 
-            # 元のzipファイルは自動削除
+            echo "--- copied yml/yaml file count: $yml_count ---"
+
+            if [ "$yml_count" -eq 0 ]; then
+              echo "!! WARNING: $zipfile に yml/yaml ファイルが1つも見つかりませんでした"
+            fi
+
+            rm -rf "$tmp_dir"
             rm -f "$zipfile"
 
-            echo "=== Done: $extract_dir ==="
-          done
+            echo "=== Done: $dest_dir ==="
+          done < <(find . -type f -iname "*.zip" -not -path "./.git/*" -print0)
+
+          if [ "$found_any" = false ]; then
+            echo "対象のzipファイルが見つかりませんでした。"
+          fi
+
+      - name: Show final state (debug)
+        run: |
+          echo "--- git status ---"
+          git status
+          echo "--- tracked yml/yaml files after extraction ---"
+          find . -type f \( -iname "*.yml" -o -iname "*.yaml" \) -not -path "./.git/*"
 
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          # 変更が無い場合はスキップ(空コミット防止)
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
