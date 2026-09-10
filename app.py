@@ -1,9 +1,10 @@
 import asyncio
 import os
-from urllib.parse import urlparse
+import re
+from urllib.parse import urlparse, urljoin, quote
 import httpx
 import yt_dlp
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -82,18 +83,100 @@ async def info(url: str = Query(...)):
         "formats": formats
     }
 
+# Niconico's delivery CDN (domand) rejects requests with no Referer/User-Agent,
+# and its playlists use byte-range-addressed fMP4 segments, so Range support
+# is required too.
+UPSTREAM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Referer": "https://www.nicovideo.jp/",
+    "Origin": "https://www.nicovideo.jp",
+}
+
+_M3U8_URI_ATTR = re.compile(r'URI="([^"]+)"')
+
+def _proxy_url(absolute_url: str) -> str:
+    return "/api/stream?url=" + quote(absolute_url, safe="")
+
+def _rewrite_manifest(text: str, base_url: str) -> str:
+    out_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            m = _M3U8_URI_ATTR.search(line)
+            if m:
+                abs_uri = urljoin(base_url, m.group(1))
+                line = line[:m.start(1)] + _proxy_url(abs_uri) + line[m.end(1):]
+            out_lines.append(line)
+        elif stripped:
+            abs_uri = urljoin(base_url, stripped)
+            out_lines.append(_proxy_url(abs_uri))
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+def _is_manifest(content_type: str, url: str, body_start: bytes) -> bool:
+    if "mpegurl" in content_type.lower():
+        return True
+    if url.split("?", 1)[0].endswith(".m3u8"):
+        return True
+    return body_start.lstrip().startswith(b"#EXTM3U")
+
 @app.get("/api/stream")
-async def stream(url: str = Query(...)):
+async def stream(request: Request, url: str = Query(...)):
     if urlparse(url).scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="Invalid media URL")
+
+    headers = dict(UPSTREAM_HEADERS)
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+
+    client = httpx.AsyncClient(follow_redirects=True, timeout=30)
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
-            upstream = await client.get(url)
-            upstream.raise_for_status()
+        req = client.build_request("GET", url, headers=headers)
+        upstream = await client.send(req, stream=True)
+        if upstream.status_code >= 400:
+            await upstream.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=502, detail=f"Upstream returned {upstream.status_code}")
+    except HTTPException:
+        raise
     except Exception as e:
+        await client.aclose()
         raise HTTPException(status_code=502, detail=f"Stream failed: {e}")
-    return StreamingResponse(iter([upstream.content]),
-                             media_type=upstream.headers.get("content-type", "application/octet-stream"))
+
+    content_type = upstream.headers.get("content-type", "application/octet-stream")
+
+    # Manifests are small text files: buffer, rewrite embedded URLs so segment/key
+    # requests come back through this proxy (with the same required headers),
+    # then close the upstream connection.
+    if _is_manifest(content_type, str(upstream.url), b""):
+        body = await upstream.aread()
+        await upstream.aclose()
+        await client.aclose()
+        if _is_manifest(content_type, str(upstream.url), body):
+            rewritten = _rewrite_manifest(body.decode("utf-8", "ignore"), str(upstream.url))
+            return HTMLResponse(content=rewritten, media_type="application/vnd.apple.mpegurl")
+        return StreamingResponse(iter([body]), media_type=content_type)
+
+    # Media segments: stream through, forwarding range/length headers so seeking
+    # and byte-range fMP4 segments keep working.
+    async def body_iter():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    passthrough_headers = {}
+    for h in ("content-length", "content-range", "accept-ranges"):
+        if h in upstream.headers:
+            passthrough_headers[h] = upstream.headers[h]
+
+    return StreamingResponse(body_iter(), status_code=upstream.status_code,
+                              media_type=content_type, headers=passthrough_headers)
 
 @app.get("/", response_class=HTMLResponse)
 async def index():

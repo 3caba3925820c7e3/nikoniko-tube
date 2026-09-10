@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NicoStream</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.15/hls.min.js"></script>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#0b0d12;color:#f4f6fb;font-family:system-ui,sans-serif}
 .wrap{max-width:1050px;margin:auto;padding:42px 20px}.hero{text-align:center;margin-bottom:32px}
@@ -27,8 +28,20 @@ form.addEventListener('submit',async e=>{e.preventDefault();let term=input.value
 try{let r=await fetch('/api/search?q='+encodeURIComponent(term)),d=await r.json();if(!r.ok)throw Error(d.detail);status.textContent=d.results.length+'件';
 results.innerHTML=d.results.map((x,i)=>'<article class="card"><img class="thumb" src="'+esc(x.thumbnail||'')+'" loading="lazy"><div class="body"><div class="title">'+esc(x.title)+'</div><div class="meta">'+esc(x.uploader||'')+(x.duration?' ・ '+fmt(x.duration):'')+'</div></div></article>').join('');
 [...results.children].forEach((el,i)=>el.onclick=()=>play(d.results[i]));}catch(e){status.textContent='エラー: '+e.message;}});
+let hls=null;
+function teardownHls(){if(hls){hls.destroy();hls=null;}}
 async function play(item){status.textContent='ストリームを準備中...';try{let r=await fetch('/api/info?url='+encodeURIComponent(item.url)),d=await r.json();if(!r.ok)throw Error(d.detail);
 let fs=(d.formats||[]).filter(x=>x.url),f=fs.filter(x=>x.vcodec!=='none'&&x.acodec!=='none').sort((a,b)=>(b.height||0)-(a.height||0))[0]||fs.find(x=>x.vcodec!=='none');if(!f)throw Error('再生可能な形式が見つかりません');
-playerTitle.textContent=d.title||item.title;video.src='/api/stream?url='+encodeURIComponent(f.url);player.style.display='block';window.scrollTo({top:0,behavior:'smooth'});status.textContent='';video.play().catch(()=>{});}catch(e){status.textContent='エラー: '+e.message;}}
-function closePlayer(silent=false){video.pause();video.removeAttribute('src');video.load();player.style.display='none';if(!silent)status.textContent='';}
+playerTitle.textContent=d.title||item.title;player.style.display='block';window.scrollTo({top:0,behavior:'smooth'});status.textContent='';
+teardownHls();video.removeAttribute('src');video.load();
+let streamUrl='/api/stream?url='+encodeURIComponent(f.url);
+let isHls=(f.protocol||'').includes('m3u8')||f.url.split('?')[0].endsWith('.m3u8');
+if(isHls&&window.Hls&&Hls.isSupported()){
+  hls=new Hls();hls.loadSource(streamUrl);hls.attachMedia(video);
+  hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)status.textContent='エラー: 再生に失敗しました ('+data.details+')';});
+}else{
+  video.src=streamUrl;
+}
+video.play().catch(()=>{});}catch(e){status.textContent='エラー: '+e.message;}}
+function closePlayer(silent=false){teardownHls();video.pause();video.removeAttribute('src');video.load();player.style.display='none';if(!silent)status.textContent='';}
 </script></body></html>
