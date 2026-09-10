@@ -1,0 +1,68 @@
+name: Auto Extract Zip (keep yml only)
+
+# zipファイルがpushされたら自動発火
+on:
+  push:
+    paths:
+      - '**/*.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  extract-zip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract zip files, keep only yml/yaml, remove zip
+        run: |
+          set -e
+
+          # unzipコマンドが無い場合に備えてインストール(ubuntu-latestには通常入っている)
+          if ! command -v unzip &> /dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y unzip
+          fi
+
+          # リポジトリ内にある全ての .zip を探索(.gitディレクトリは除外)
+          # → どのリポジトリ・どんな場所にあるzipでも対応
+          find . -type f -iname "*.zip" -not -path "./.git/*" -print0 | while IFS= read -r -d '' zipfile; do
+            echo "=== Processing: $zipfile ==="
+
+            dir=$(dirname "$zipfile")
+            base=$(basename "$zipfile" .zip)
+            extract_dir="$dir/$base"
+
+            mkdir -p "$extract_dir"
+
+            # zip解凍(文字化け対策としてUTF-8指定、日本語ファイル名にも対応)
+            unzip -o -O UTF-8 "$zipfile" -d "$extract_dir" || unzip -o "$zipfile" -d "$extract_dir"
+
+            # yml, yaml 以外のファイルを全部削除
+            find "$extract_dir" -type f ! -iname "*.yml" ! -iname "*.yaml" -delete
+
+            # 中身が空になったディレクトリを削除
+            find "$extract_dir" -type d -empty -delete
+
+            # 元のzipファイルは自動削除
+            rm -f "$zipfile"
+
+            echo "=== Done: $extract_dir ==="
+          done
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          # 変更が無い場合はスキップ(空コミット防止)
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: auto-extract zip, keep yml only, remove zip [skip ci]"
+            git push
+          fi
