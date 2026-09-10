@@ -20,15 +20,22 @@ app = FastAPI(title="NicoStream")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 NICO_SEARCH_API = "https://snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search"
-PROXY_API = os.getenv(
-    "PROXY_API_URL",
-    "https://api.proxyscrape.com/v4/free-proxy-list/get"
-    "?request=display_proxies&proxy_format=protocolipport&format=text"
-    "&country=jp&protocol=http"
-)
 PROXY_REFRESH_SECONDS = int(os.getenv("PROXY_REFRESH_SECONDS", "300"))
-PROXY_TEST_TIMEOUT = float(os.getenv("PROXY_TEST_TIMEOUT", "6"))
-PROXY_CANDIDATES = int(os.getenv("PROXY_CANDIDATES", "40"))
+PROXY_TEST_TIMEOUT = float(os.getenv("PROXY_TEST_TIMEOUT", "8"))
+PROXY_CANDIDATES = int(os.getenv("PROXY_CANDIDATES", "120"))
+PROXY_TEST_CONCURRENCY = int(os.getenv("PROXY_TEST_CONCURRENCY", "30"))
+
+# Multiple public sources are used because a country/protocol shard can temporarily
+# be empty. The metadata endpoints are only used to discover candidates; every
+# candidate is still tested from this Railway instance before it is accepted.
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=jp&protocol=http",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=jp&protocol=https",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=jp&protocol=socks5",
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&country=JP&protocols=http",
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&country=JP&protocols=https",
+    "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&country=JP&protocols=socks5",
+]
 
 UPSTREAM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -60,25 +67,53 @@ def _normalize_proxy(line: str) -> str | None:
     return f"{p.scheme}://{p.hostname}:{p.port}"
 
 async def _fetch_proxy_candidates() -> list[str]:
+    headers = {"User-Agent": UPSTREAM_HEADERS["User-Agent"], "Accept": "application/json,text/plain,*/*"}
+    candidates = []
+    seen = set()
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        r = await client.get(PROXY_API, headers={"User-Agent": "NicoStream/1.0"})
-        r.raise_for_status()
-        candidates = []
-        for line in r.text.splitlines():
-            p = _normalize_proxy(line)
-            if p and p not in candidates:
-                candidates.append(p)
-        return candidates[:PROXY_CANDIDATES]
+        for source in PROXY_SOURCES:
+            try:
+                r = await client.get(source, headers=headers)
+                r.raise_for_status()
+                if "geonode.com" in source:
+                    payload = r.json()
+                    rows = payload.get("data", []) if isinstance(payload, dict) else []
+                    for row in rows:
+                        ip, port = row.get("ip"), row.get("port")
+                        protocols = [str(x).lower() for x in (row.get("protocols") or [])]
+                        for proto in protocols:
+                            if proto in ("http", "https", "socks5") and ip and port:
+                                p = f"{proto}://{ip}:{port}"
+                                if p not in seen:
+                                    seen.add(p); candidates.append(p)
+                else:
+                    for line in r.text.splitlines():
+                        p = _normalize_proxy(line)
+                        if p and p not in seen:
+                            seen.add(p); candidates.append(p)
+                logger.info("Proxy source returned candidates: %s (%d total)", source.split('/')[2], len(candidates))
+            except Exception as e:
+                logger.warning("Proxy source failed: %s | %s", source, e)
+    return candidates[:PROXY_CANDIDATES]
 
 async def _test_proxy(proxy: str) -> bool:
-    # First check the exit country. Then make a real Niconico request.
+    # Validate both the exit country and the actual target. Some public proxies
+    # answer generic IP checks but cannot CONNECT to the target site.
     try:
         timeout = httpx.Timeout(PROXY_TEST_TIMEOUT, connect=PROXY_TEST_TIMEOUT)
         async with httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=True) as c:
-            country = await c.get("https://ipapi.co/country/", headers=UPSTREAM_HEADERS)
-            if country.status_code != 200 or country.text.strip().upper() != "JP":
+            country = None
+            for check_url in ("https://ipapi.co/country/", "https://ipinfo.io/country"):
+                try:
+                    r = await c.get(check_url, headers=UPSTREAM_HEADERS)
+                    if r.status_code == 200:
+                        country = r.text.strip().upper()
+                        break
+                except Exception:
+                    pass
+            if country != "JP":
                 return False
-            nico = await c.get("https://www.nicovideo.jp/", headers=UPSTREAM_HEADERS)
+            nico = await c.get("https://snapshot.search.nicovideo.jp/", headers=UPSTREAM_HEADERS)
             return nico.status_code < 500
     except Exception:
         return False
@@ -95,10 +130,10 @@ async def _choose_jp_proxy(force: bool = False) -> str:
             return _proxy_state.url
 
         candidates = await _fetch_proxy_candidates()
-        # Test in small parallel batches. Free proxies are volatile, so don't trust
-        # the list's advertised status until the proxy itself is checked from here.
-        for start in range(0, len(candidates), 10):
-            batch = candidates[start:start + 10]
+        # Test many candidates concurrently; public proxies are volatile and a
+        # serial check can take several minutes before finding one that works.
+        for start in range(0, len(candidates), PROXY_TEST_CONCURRENCY):
+            batch = candidates[start:start + PROXY_TEST_CONCURRENCY]
             results = await asyncio.gather(*(_test_proxy(p) for p in batch), return_exceptions=True)
             for proxy, ok in zip(batch, results):
                 if ok is True:

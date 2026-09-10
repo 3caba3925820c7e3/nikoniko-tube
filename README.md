@@ -1,31 +1,32 @@
 # NicoStream — Railway / Japan Proxy build
 
-Railway-ready NicoStream build. Railway detects the root `Dockerfile` automatically.
+Railway-ready NicoStream build. The root `Dockerfile` is used automatically by Railway.
 
 ## Behavior
 
-- Gets fresh public HTTP proxies with country filter `JP` from ProxyScrape.
-- Verifies a candidate's exit country is Japan and checks Niconico connectivity before using it.
-- Uses the selected Japanese proxy for Niconico search, yt-dlp metadata extraction, and playback.
-- `/api/info` creates a playback session and pins that session to one proxy.
-- HLS manifests are rewritten so child playlist/segment requests stay on the same proxy/session.
-- A new playback session can select a new proxy after the current proxy expires/fails.
-- Proxy candidates are refreshed after `PROXY_REFRESH_SECONDS` (default 300 seconds).
+- Pulls Japanese proxy candidates from multiple public sources (ProxyScrape + GeoNode).
+- Tries HTTP, HTTPS and SOCKS5 candidates; SOCKS5 support is included in dependencies.
+- Verifies the exit country is Japan and then checks Niconico connectivity before accepting a proxy.
+- Uses the selected Japanese proxy for search and yt-dlp metadata extraction.
+- `/api/info` creates a playback session pinned to one proxy.
+- HLS manifests are rewritten so child playlist/segment requests keep the same session proxy.
+- The app never silently falls back to a non-Japanese proxy.
+- Candidate discovery refreshes every 5 minutes by default.
+
+## Important
+
+Free public proxies can disappear, reject HTTPS CONNECT, be rate-limited, or be too slow for video. If all current Japanese candidates are dead, the app correctly returns `No working Japanese HTTP proxy is currently available` instead of using a non-Japanese IP.
 
 ## Railway
 
-Push the contents of this ZIP to the root of a GitHub repository and connect that repository to Railway.
-No custom Start Command is required: Railway automatically detects a root `Dockerfile` and uses its `CMD`.
+Push the contents of this ZIP to the root of a GitHub repository and connect that repository to Railway. The root `Dockerfile` starts Uvicorn, so a custom Railway Start Command is not required.
 
-Optional Railway variables:
+Optional variables:
 
 - `PROXY_REFRESH_SECONDS=300`
-- `PROXY_TEST_TIMEOUT=6`
-- `PROXY_CANDIDATES=40`
+- `PROXY_TEST_TIMEOUT=8`
+- `PROXY_CANDIDATES=120`
+- `PROXY_TEST_CONCURRENCY=30`
 - `SESSION_TTL=21600`
-- `PROXY_API_URL=` to replace the default ProxyScrape endpoint
 
-Public proxies are inherently unreliable and may be slow, blocked, or disappear. The app fails cleanly when no working Japanese proxy is available rather than silently using a non-Japanese proxy.
-
-Railway's Dockerfile detection and default start behavior are documented here:
-https://docs.railway.com/builds/dockerfiles
+The public proxy sources are third-party services and are not guaranteed to have a live Japanese endpoint at every moment.
